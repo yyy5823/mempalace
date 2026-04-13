@@ -7,9 +7,14 @@ Returns verbatim text — the actual words, never summaries.
 """
 
 import logging
+import re
 from pathlib import Path
 
-from .palace import get_collection
+from .palace import get_closets_collection, get_collection
+
+# Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
+# Multiple lines may join with newlines inside one closet document.
+_CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -27,6 +32,116 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
     elif room:
         return {"room": room}
     return {}
+
+
+def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
+    """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
+
+    Preserves order and dedupes.
+    """
+    seen: dict = {}
+    for match in _CLOSET_DRAWER_REF_RE.findall(closet_doc):
+        for did in match.split(","):
+            did = did.strip()
+            if did and did not in seen:
+                seen[did] = None
+    return list(seen.keys())
+
+
+def _closet_first_hits(
+    palace_path: str,
+    query: str,
+    where: dict,
+    drawers_col,
+    n_results: int,
+    max_distance: float,
+):
+    """Run a closet-first search and return chunk-level drawer hits.
+
+    Returns:
+        non-empty list of hits when the closet path produced usable matches.
+        ``None`` when the closet collection is empty/missing OR when every
+        candidate drawer was filtered out (e.g. by max_distance); the
+        caller should fall back to direct drawer search.
+    """
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except Exception:
+        return None
+
+    try:
+        ckwargs = {
+            "query_texts": [query],
+            "n_results": max(n_results * 2, 5),
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            ckwargs["where"] = where
+        closet_results = closets_col.query(**ckwargs)
+    except Exception:
+        return None
+
+    closet_docs = closet_results["documents"][0] if closet_results["documents"] else []
+    if not closet_docs:
+        return None
+
+    closet_metas = closet_results["metadatas"][0]
+    closet_dists = closet_results["distances"][0]
+
+    # Collect candidate drawer IDs in closet-rank order, dedupe, remember
+    # which closet (and its distance/preview) introduced each one.
+    drawer_id_order: list = []
+    drawer_provenance: dict = {}
+    for cdoc, cmeta, cdist in zip(closet_docs, closet_metas, closet_dists):
+        for did in _extract_drawer_ids_from_closet(cdoc):
+            if did in drawer_provenance:
+                continue
+            drawer_provenance[did] = (cdist, cdoc, cmeta)
+            drawer_id_order.append(did)
+
+    if not drawer_id_order:
+        return None
+
+    # Hydrate exactly those drawers — chunk-level, not whole-file.
+    try:
+        fetched = drawers_col.get(
+            ids=drawer_id_order,
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return None
+
+    fetched_ids = fetched.get("ids") or []
+    fetched_docs = fetched.get("documents") or []
+    fetched_metas = fetched.get("metadatas") or []
+    fetched_map = {
+        did: (doc, meta) for did, doc, meta in zip(fetched_ids, fetched_docs, fetched_metas)
+    }
+
+    hits: list = []
+    for did in drawer_id_order:
+        if did not in fetched_map:
+            continue  # closet pointed to a drawer that no longer exists
+        doc, meta = fetched_map[did]
+        cdist, cdoc, _ = drawer_provenance[did]
+        if max_distance > 0.0 and cdist > max_distance:
+            continue
+        hits.append(
+            {
+                "text": doc,
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(meta.get("source_file", "?")).name,
+                "similarity": round(max(0.0, 1 - cdist), 3),
+                "distance": round(cdist, 4),
+                "matched_via": "closet",
+                "closet_preview": cdoc[:200],
+            }
+        )
+        if len(hits) >= n_results:
+            break
+
+    return hits if hits else None
 
 
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
@@ -117,7 +232,7 @@ def search_memories(
             0.0 disables filtering. Typical useful range: 0.3–1.0.
     """
     try:
-        col = get_collection(palace_path, create=False)
+        drawers_col = get_collection(palace_path, create=False)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -127,6 +242,27 @@ def search_memories(
 
     where = build_where_filter(wing, room)
 
+    # Closet-first search: scan the compact index, parse drawer pointers
+    # from each matching line, then hydrate exactly those drawers. This
+    # keeps the result shape chunk-level (consistent with direct search)
+    # and applies the same max_distance filter.
+    closet_hits = _closet_first_hits(
+        palace_path=palace_path,
+        query=query,
+        where=where,
+        drawers_col=drawers_col,
+        n_results=n_results,
+        max_distance=max_distance,
+    )
+    if closet_hits is not None:
+        return {
+            "query": query,
+            "filters": {"wing": wing, "room": room},
+            "total_before_filter": len(closet_hits),
+            "results": closet_hits,
+        }
+
+    # Fallback: direct drawer search (no closets yet, or closets empty)
     try:
         kwargs = {
             "query_texts": [query],
@@ -136,7 +272,7 @@ def search_memories(
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        results = drawers_col.query(**kwargs)
     except Exception as e:
         return {"error": f"Search error: {e}"}
 
@@ -157,6 +293,7 @@ def search_memories(
                 "source_file": Path(meta.get("source_file", "?")).name,
                 "similarity": round(max(0.0, 1 - dist), 3),
                 "distance": round(dist, 4),
+                "matched_via": "drawer",
             }
         )
 

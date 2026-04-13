@@ -18,9 +18,13 @@ from collections import defaultdict
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    build_closet_lines,
     file_already_mined,
+    get_closets_collection,
     get_collection,
     mine_lock,
+    purge_file_closets,
+    upsert_closet_lines,
 )
 
 READABLE_EXTENSIONS = {
@@ -417,6 +421,7 @@ def process_file(
     rooms: list,
     agent: str,
     dry_run: bool,
+    closets_col=None,
 ) -> tuple:
     """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
 
@@ -472,6 +477,33 @@ def process_file(
             )
             if added:
                 drawers_added += 1
+
+        # Build closet — the searchable index pointing to these drawers.
+        # Purge first: a re-mine (mtime change or normalize_version bump) must
+        # fully replace the prior closets, not append to them.
+        if closets_col and drawers_added > 0:
+            drawer_ids = [
+                f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
+                for c in chunks
+            ]
+            closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
+            closet_id_base = (
+                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+            )
+            purge_file_closets(closets_col, source_file)
+            upsert_closet_lines(
+                closets_col,
+                closet_id_base,
+                closet_lines,
+                {
+                    "wing": wing,
+                    "room": room,
+                    "source_file": source_file,
+                    "drawer_count": drawers_added,
+                    "filed_at": datetime.now().isoformat(),
+                    "normalize_version": NORMALIZE_VERSION,
+                },
+            )
 
     return drawers_added, room
 
@@ -593,8 +625,10 @@ def mine(
 
     if not dry_run:
         collection = get_collection(palace_path)
+        closets_col = get_closets_collection(palace_path)
     else:
         collection = None
+        closets_col = None
 
     total_drawers = 0
     files_skipped = 0
@@ -609,6 +643,7 @@ def mine(
             rooms=rooms,
             agent=agent,
             dry_run=dry_run,
+            closets_col=closets_col,
         )
         if drawers == 0 and not dry_run:
             files_skipped += 1
