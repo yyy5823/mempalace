@@ -205,6 +205,8 @@ def search_memories(
         pass  # no closets yet — fall through to direct drawer search
 
     # If closets found results, hydrate the referenced drawers
+    MAX_HYDRATION_CHARS = 10000  # cap to prevent blowup on large source files
+
     if closet_hits:
         import re
         seen_sources = set()
@@ -215,18 +217,39 @@ def search_memories(
                 continue
             seen_sources.add(source)
 
-            # Find drawers for this source file
+            # Find drawers for this source file, grep for most relevant chunk
             try:
                 drawer_results = drawers_col.get(
                     where={"source_file": source},
                     include=["documents", "metadatas"],
                 )
                 if drawer_results.get("ids"):
-                    # Combine all drawer content for this file
-                    full_text = "\n\n".join(drawer_results["documents"])
-                    meta = drawer_results["metadatas"][0]
+                    # Drawer-grep: score each chunk against the query,
+                    # return the best-matching chunk first + surrounding context
+                    query_terms = set(re.findall(r'\w{2,}', query.lower()))
+                    best_idx = 0
+                    best_score = -1
+                    for idx, doc in enumerate(drawer_results["documents"]):
+                        doc_lower = doc.lower()
+                        score = sum(1 for t in query_terms if t in doc_lower)
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
+
+                    # Build result: best chunk first, then neighbors
+                    docs = drawer_results["documents"]
+                    n_docs = len(docs)
+                    # Include best chunk + 1 before + 1 after for context
+                    start = max(0, best_idx - 1)
+                    end = min(n_docs, best_idx + 2)
+                    relevant_text = "\n\n".join(docs[start:end])
+
+                    if len(relevant_text) > MAX_HYDRATION_CHARS:
+                        relevant_text = relevant_text[:MAX_HYDRATION_CHARS] + f"\n\n[...truncated. {n_docs} total drawers. Use mempalace_get_drawer for full content.]"
+
+                    meta = drawer_results["metadatas"][best_idx]
                     hits.append({
-                        "text": full_text,
+                        "text": relevant_text,
                         "wing": meta.get("wing", "unknown"),
                         "room": meta.get("room", "unknown"),
                         "source_file": Path(source).name,
@@ -234,6 +257,8 @@ def search_memories(
                         "distance": round(closet_dist, 4),
                         "matched_via": "closet",
                         "closet_preview": closet_doc[:200],
+                        "drawer_index": best_idx,
+                        "total_drawers": n_docs,
                     })
             except Exception:
                 pass
