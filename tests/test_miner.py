@@ -224,6 +224,23 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def test_entity_metadata_finds_cyrillic_names(monkeypatch):
+    """Entity extraction must find non-Latin names when entity_languages includes the locale."""
+    import mempalace.palace as palace_mod
+    from mempalace.miner import _extract_entities_for_metadata
+
+    # Reset cached patterns so they reload with the monkeypatched languages
+    monkeypatch.setattr(palace_mod, "_CANDIDATE_RX_CACHE", None)
+    monkeypatch.setattr(
+        "mempalace.config.MempalaceConfig.entity_languages",
+        property(lambda self: ("en", "ru")),
+    )
+
+    content = "Михаил написал код. Михаил отправил PR. Михаил получил ревью."
+    result = _extract_entities_for_metadata(content)
+    assert "Михаил" in result, f"Cyrillic name not found in entity metadata: {result!r}"
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:

@@ -513,8 +513,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
             matched.add(name)
 
+    from .palace import _candidate_entity_words
+
     window = content[:_ENTITY_EXTRACT_WINDOW]
-    words = re.findall(r"\b[A-Z][a-z]{2,}\b", window)
+    words = _candidate_entity_words(window)
     freq: dict = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
